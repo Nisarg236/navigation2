@@ -30,6 +30,8 @@
 #include "nav2_smac_planner/node_lattice.hpp"
 #include "nav2_smac_planner/types.hpp"
 #include "nav2_smac_planner/constants.hpp"
+#include "geometry_msgs/msg/point.hpp"
+#include "geometry_msgs/msg/pose.hpp"
 
 namespace nav2_smac_planner
 {
@@ -186,6 +188,17 @@ public:
    * @param expanded_nodes Expanded node to clean up from search
    */
   void cleanNode(const NodePtr & nodes);
+
+  /**
+   * @brief Sets search bounds for overshoot limiting in analytic expansion
+   * @param search_bounds The goal/bound pose
+   * @param start_point The start point
+   * @param allow_goal_overshoot If overshoot is allowed
+   */
+  void setSearchBounds(
+    const geometry_msgs::msg::Pose & search_bounds,
+    const geometry_msgs::msg::Point & start_point,
+    bool allow_goal_overshoot);
 
 protected:
   MotionModel _motion_model;

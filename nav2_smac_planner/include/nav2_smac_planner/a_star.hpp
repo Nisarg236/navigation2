@@ -23,6 +23,9 @@
 #include <utility>
 #include <vector>
 
+#include "geometry_msgs/msg/point.hpp"
+#include "geometry_msgs/msg/pose.hpp"
+
 #include "nav2_costmap_2d/costmap_2d.hpp"
 #include "nav2_core/planner_exceptions.hpp"
 
@@ -131,6 +134,23 @@ public:
    * @param collision_checker Collision checker to use for checking state validity
    */
   void setCollisionChecker(GridCollisionChecker * collision_checker);
+
+  /**
+   * @brief Used to limit the planner to explore ahead of the specified pose
+   * @param search_bounds Pose beyond which planning should not pass if overshoot is disabled
+   * @param start_point Planning start point
+   * @param allow_goal_overshoot Enable / disable overshoot behavior
+   */
+  void setSearchBounds(
+    const geometry_msgs::msg::Pose & search_bounds,
+    const geometry_msgs::msg::Point & start_point,
+    bool allow_goal_overshoot);
+
+  /**
+   * @brief Force a straight-line path check mode
+   * @param search_straight_path true to use straight-path interpolation mode
+   */
+  void setSearchStraightPathFlag(const bool search_straight_path);
 
   /**
    * @brief Set the goal for planning, as a node index
@@ -284,6 +304,22 @@ protected:
    * @return if node has been visited
    */
   inline bool onVisitationCheckNode(const NodePtr & node);
+
+  /**
+   * @brief check the position of a node, with respect to a pose
+   * @param node node to evaluate
+   * @param pose reference pose
+   * @return true if node is behind pose heading
+   */
+  bool isBehindPose(const NodePtr & node, const geometry_msgs::msg::Pose & pose);
+
+  /**
+   * @brief Compute straight path by interpolation from start to goal.
+   * @param path output interpolated path
+   * @param cancel_checker cancellation callback
+   * @return true if straight path collision-free
+   */
+  bool getStraightPath(CoordinateVector & path, std::function<bool()> cancel_checker);
 
   /**
    * @brief Populate a debug log of expansions for Hybrid-A* for visualization

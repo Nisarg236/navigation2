@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "nav2_smac_planner/a_star.hpp"
+#include "nav2_smac_planner/utils.hpp"
 using namespace std::chrono;  // NOLINT
 
 namespace nav2_smac_planner
@@ -132,6 +133,24 @@ void AStarAlgorithm<NodeT>::setCollisionChecker(GridCollisionChecker * collision
 }
 
 template<typename NodeT>
+void AStarAlgorithm<NodeT>::setSearchBounds(
+  const geometry_msgs::msg::Pose & search_bounds,
+  const geometry_msgs::msg::Point & start_point,
+  bool allow_goal_overshoot)
+{
+  _search_info.setSearchBound(search_bounds);
+  _search_info.setStart(start_point);
+  _search_info.allow_goal_overshoot = allow_goal_overshoot;
+  _expander->setSearchBounds(search_bounds, start_point, allow_goal_overshoot);
+}
+
+template<typename NodeT>
+void AStarAlgorithm<NodeT>::setSearchStraightPathFlag(const bool search_straight_path)
+{
+  _search_info.search_straight_path = search_straight_path;
+}
+
+template<typename NodeT>
 typename AStarAlgorithm<NodeT>::NodePtr AStarAlgorithm<NodeT>::addToGraph(
   const uint64_t & index)
 {
@@ -195,6 +214,28 @@ void AStarAlgorithm<NodeT>::populateExpansionsLog(
     _costmap->getOriginX() + (coords.x * _costmap->getResolution()),
     _costmap->getOriginY() + (coords.y * _costmap->getResolution()),
     _shared_ctx->motion_table.getAngleFromBin(coords.theta));
+}
+
+template<>
+bool AStarAlgorithm<Node2D>::isBehindPose(
+  const NodePtr & node,
+  const geometry_msgs::msg::Pose & pose)
+{
+  const Node2D::Coordinates node_coords = node->getCoords(node->getIndex());
+  const geometry_msgs::msg::Pose node_world = getWorldCoords(
+    node_coords.x, node_coords.y, _costmap);
+  return nav2_smac_planner::isBehindPose(node_world.position, pose);
+}
+
+template<typename NodeT>
+bool AStarAlgorithm<NodeT>::isBehindPose(
+  const NodePtr & node,
+  const geometry_msgs::msg::Pose & pose)
+{
+  const typename NodeT::Coordinates node_coords = node->pose;
+  const geometry_msgs::msg::Pose node_world = getWorldCoords(
+    node_coords.x, node_coords.y, _costmap);
+  return nav2_smac_planner::isBehindPose(node_world.position, pose);
 }
 
 template<>
@@ -361,6 +402,11 @@ bool AStarAlgorithm<NodeT>::createPath(
     return false;
   }
 
+  // Check if we should use straight path
+  if (_search_info.search_straight_path) {
+    return getStraightPath(path, cancel_checker);
+  }
+
   NodeVector coarse_check_goals, fine_check_goals;
   _goal_manager.prepareGoalsForAnalyticExpansion(
     coarse_check_goals, fine_check_goals,
@@ -380,6 +426,7 @@ bool AStarAlgorithm<NodeT>::createPath(
   NeighborIterator neighbor_iterator;
   int analytic_iterations = 0;
   int closest_distance = std::numeric_limits<int>::max();
+  const bool is_start_behind_goal = _search_info.isStartBehindSearchBounds();
 
   // Given an index, return a node ptr reference if its collision-free and valid
   const uint64_t max_index = static_cast<uint64_t>(getSizeX()) *
@@ -390,6 +437,18 @@ bool AStarAlgorithm<NodeT>::createPath(
     {
       if (index >= max_index) {
         return false;
+      }
+
+      if (!_search_info.allow_goal_overshoot) {
+        auto iter = _graph.find(index);
+        if (iter != _graph.end()) {
+          if (isBehindPose(
+              &(iter->second),
+              _search_info.getSearchBound()) != is_start_behind_goal)
+          {
+            return false;
+          }
+        }
       }
 
       neighbor_rtn = addToGraph(index);
@@ -458,6 +517,12 @@ bool AStarAlgorithm<NodeT>::createPath(
       neighbor_iterator != neighbors.end(); ++neighbor_iterator)
     {
       neighbor = *neighbor_iterator;
+
+      if (!_search_info.allow_goal_overshoot) {
+        if (isBehindPose(neighbor, _search_info.getSearchBound()) != is_start_behind_goal) {
+          continue;
+        }
+      }
 
       // 4.1) Compute the cost to go to this node
       g_cost = current_node->getAccumulatedCost() + current_node->getTraversalCost(neighbor);
@@ -602,6 +667,79 @@ typename AStarAlgorithm<NodeT>::NodeContext * AStarAlgorithm<NodeT>::getContext(
 }
 
 // Instantiate algorithm for the supported template types
+
+template<typename NodeT>
+bool AStarAlgorithm<NodeT>::getStraightPath(
+  CoordinateVector & path,
+  std::function<bool()> cancel_checker)
+{
+  typename NodeT::Coordinates start_coords;
+  if constexpr (std::is_same<NodeT, Node2D>::value) {
+    start_coords = _start->getCoords(_start->getIndex());
+  } else {
+    start_coords = _start->pose;
+  }
+
+  typename NodeT::Coordinates goal_coords = _goal_coordinates;
+  std::vector<Coordinates> path_coordinates;
+  path_coordinates.push_back(goal_coords);
+
+  const float dx = start_coords.x - goal_coords.x;
+  const float dy = start_coords.y - goal_coords.y;
+  const float steps = std::max(std::abs(dx), std::abs(dy));
+
+  for (int i = 1; i < static_cast<int>(steps); ++i) {
+    if (cancel_checker()) {
+      return false;
+    }
+
+    const float ratio = static_cast<float>(i) / steps;
+    typename NodeT::Coordinates intermediate;
+    intermediate.x = goal_coords.x + dx * ratio;
+    intermediate.y = goal_coords.y + dy * ratio;
+
+    if constexpr (!std::is_same<NodeT, Node2D>::value) {
+      intermediate.theta = goal_coords.theta;
+    }
+
+    uint64_t index;
+    if constexpr (std::is_same<NodeT, Node2D>::value) {
+      index = Node2D::getIndex(
+        static_cast<unsigned int>(intermediate.x),
+        static_cast<unsigned int>(intermediate.y),
+        _costmap->getSizeInCellsX());
+    } else {
+      index = NodeT::getIndex(
+        static_cast<unsigned int>(intermediate.x),
+        static_cast<unsigned int>(intermediate.y),
+        static_cast<unsigned int>(intermediate.theta));
+    }
+
+    NodePtr node = addToGraph(index);
+
+    if constexpr (!std::is_same<NodeT, Node2D>::value) {
+      node->setPose(intermediate);
+    }
+
+    if (!node->isNodeValid(_traverse_unknown, _collision_checker)) {
+      return false;
+    }
+
+    path_coordinates.push_back(intermediate);
+  }
+
+  path_coordinates.push_back(start_coords);
+
+  if constexpr (!std::is_same<NodeT, Node2D>::value) {
+    for (auto & coord : path_coordinates) {
+      coord.theta = NodeT::motion_table.getAngleFromBin(coord.theta);
+    }
+  }
+
+  path = std::move(path_coordinates);
+  return true;
+}
+
 template class AStarAlgorithm<Node2D>;
 template class AStarAlgorithm<NodeHybrid>;
 template class AStarAlgorithm<NodeLattice>;

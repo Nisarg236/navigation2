@@ -110,6 +110,50 @@ protected:
    */
   void updateParametersCallback(const std::vector<rclcpp::Parameter> & parameters);
 
+  /**
+   * @brief Compute waypoints for goal alignment based on goal_align_distance
+   * @param start Start pose
+   * @param goal Goal pose
+   * @param tolerance Position tolerance
+   * @return Vector of waypoint poses (0, 1, or 2)
+   */
+  std::vector<geometry_msgs::msg::PoseStamped> computeWaypoints(
+    const geometry_msgs::msg::PoseStamped & start,
+    const geometry_msgs::msg::PoseStamped & goal,
+    float tolerance);
+
+  /**
+   * @brief Plan a path via a waypoint (start->waypoint->goal)
+   * @param start Start pose
+   * @param waypoint Intermediate waypoint
+   * @param goal Goal pose
+   * @param cancel_checker Cancellation callback
+   * @return Generated path or empty path on failure
+   */
+  nav_msgs::msg::Path planWithWaypoint(
+    const geometry_msgs::msg::PoseStamped & start,
+    const geometry_msgs::msg::PoseStamped & waypoint,
+    const geometry_msgs::msg::PoseStamped & goal,
+    std::function<bool()> cancel_checker);
+
+  /**
+   * @brief Compute a plan between two poses (internal helper)
+   * @param start Start pose
+   * @param goal Goal pose
+   * @param cancel_checker Cancellation callback
+   * @return Generated path
+   */
+  nav_msgs::msg::Path getPath(
+    const geometry_msgs::msg::PoseStamped & start,
+    const geometry_msgs::msg::PoseStamped & goal,
+    std::function<bool()> cancel_checker);
+
+  /**
+   * @brief Publish an occupancy grid highlighting collision cells at a given pose
+   * @param robot_pose Pose to check
+   */
+  void publishCollisionMap(const geometry_msgs::msg::Pose & robot_pose);
+
   std::unique_ptr<AStarAlgorithm<NodeHybrid>> _a_star;
   GridCollisionChecker _collision_checker;
   std::unique_ptr<Smoother> _smoother;
@@ -145,6 +189,8 @@ protected:
     _smoothed_footprints_publisher;
   nav2::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr
     _expansions_publisher;
+  rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::OccupancyGrid>::SharedPtr
+    _collision_map_publisher;
   std::mutex _mutex;
   nav2::LifecycleNode::WeakPtr _node;
 

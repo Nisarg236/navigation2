@@ -19,6 +19,11 @@
 #include <utility>
 #include <string>
 #include <memory>
+#include <optional>
+#include <cmath>
+
+#include "geometry_msgs/msg/point.hpp"
+#include "geometry_msgs/msg/pose.hpp"
 
 #include "nav2_ros_common/lifecycle_node.hpp"
 #include "nav2_ros_common/node_utils.hpp"
@@ -46,13 +51,64 @@ struct SearchInfo
   float analytic_expansion_ratio{3.5};
   float analytic_expansion_max_length{60.0};
   float analytic_expansion_max_cost{200.0};
+  float goal_align_distance{0.0};
   bool analytic_expansion_max_cost_override{false};
   std::string lattice_filepath;
   bool cache_obstacle_heuristic{false};
   bool allow_reverse_expansion{false};
   bool allow_primitive_interpolation{false};
+  bool allow_goal_overshoot{true};
   bool downsample_obstacle_heuristic{true};
   bool use_quadratic_cost_penalty{false};
+  bool search_straight_path{false};
+
+  inline void setStart(const geometry_msgs::msg::Point & start)
+  {
+    _start_pose = start;
+    is_start_behind_goal.reset();
+  }
+
+  inline geometry_msgs::msg::Pose getSearchBound() const
+  {
+    return _search_bound;
+  }
+
+  inline void setSearchBound(const geometry_msgs::msg::Pose & search_bound)
+  {
+    _search_bound = search_bound;
+    is_start_behind_goal.reset();
+  }
+
+  inline bool isStartBehindSearchBounds()
+  {
+    if (is_start_behind_goal) {
+      return *is_start_behind_goal;
+    }
+
+    const auto & point = _start_pose;
+    const auto & pose = _search_bound;
+    const double yaw = std::atan2(
+      2.0 * (pose.orientation.w * pose.orientation.z +
+      pose.orientation.x * pose.orientation.y),
+      1.0 - 2.0 * (
+        pose.orientation.y * pose.orientation.y +
+      pose.orientation.z * pose.orientation.z));
+
+    const float dx = std::cos(yaw);
+    const float dy = std::sin(yaw);
+
+    const float vx = point.x - pose.position.x;
+    const float vy = point.y - pose.position.y;
+
+    const float dot = vx * dx + vy * dy;
+    is_start_behind_goal = (dot < 0.0f);
+    return *is_start_behind_goal;
+  }
+
+private:
+  geometry_msgs::msg::Point _start_pose;
+  geometry_msgs::msg::Pose _search_bound;
+  std::optional<bool> is_start_behind_goal;
 };
 
 /**

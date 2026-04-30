@@ -20,6 +20,7 @@
 #include <memory>
 #include <string>
 
+#include "angles/angles.h"
 #include "nlohmann/json.hpp"
 #include "geometry_msgs/msg/quaternion.hpp"
 #include "geometry_msgs/msg/pose.hpp"
@@ -63,6 +64,78 @@ inline geometry_msgs::msg::Quaternion getWorldOrientation(
   tf2::Quaternion q;
   q.setRPY(0.0, 0.0, theta);
   return tf2::toMsg(q);
+}
+
+/**
+* @brief Check if point is behind a reference pose heading
+* @param point Point to evaluate
+* @param reference_pose Reference pose for heading
+* @return true if behind pose heading
+*/
+inline bool isBehindPose(
+  const geometry_msgs::msg::Point & point,
+  const geometry_msgs::msg::Pose & reference_pose)
+{
+  const double yaw = tf2::getYaw(reference_pose.orientation);
+  const float dx = std::cos(yaw);
+  const float dy = std::sin(yaw);
+  const float vx = point.x - reference_pose.position.x;
+  const float vy = point.y - reference_pose.position.y;
+  return (vx * dx + vy * dy) < 0.0f;
+}
+
+/**
+* @brief Check if 2 poses are within position and yaw tolerances
+* @param pose1 Pose 1
+* @param pose2 Pose 2
+* @param tolerance Shared position and yaw tolerance
+* @return true if poses are equivalent under tolerance
+*/
+inline bool isSamePose(
+  const geometry_msgs::msg::Pose & pose1,
+  const geometry_msgs::msg::Pose & pose2,
+  const double tolerance)
+{
+  const double yaw_offset = angles::shortest_angular_distance(
+    tf2::getYaw(pose1.orientation), tf2::getYaw(pose2.orientation));
+  const double distance = std::hypot(
+    pose1.position.x - pose2.position.x,
+    pose1.position.y - pose2.position.y);
+  return distance <= tolerance && std::fabs(yaw_offset) <= tolerance;
+}
+
+/**
+* @brief Check if pose is between 2 poses along their heading direction split
+* @param pose Pose to check
+* @param pose_1 Pose 1
+* @param pose_2 Pose 2
+* @return true if between both heading half-planes
+*/
+inline bool isBetweenPoints(
+  const geometry_msgs::msg::Pose & pose,
+  const geometry_msgs::msg::Pose & pose_1,
+  const geometry_msgs::msg::Pose & pose_2)
+{
+  const bool behind_waypoint = isBehindPose(pose.position, pose_1);
+  const bool behind_goal = isBehindPose(pose.position, pose_2);
+  return behind_goal != behind_waypoint;
+}
+
+/**
+* @brief Returns a pose translated along its heading by distance meters
+* @param pose Input pose
+* @param distance Translation distance along heading
+* @return translated pose
+*/
+inline geometry_msgs::msg::Pose getPoseAtDistanceAlongHeading(
+  const geometry_msgs::msg::Pose & pose,
+  const float & distance)
+{
+  geometry_msgs::msg::Pose output_pose = pose;
+  const double yaw = tf2::getYaw(pose.orientation);
+  output_pose.position.x = pose.position.x + distance * std::cos(yaw);
+  output_pose.position.y = pose.position.y + distance * std::sin(yaw);
+  return output_pose;
 }
 
 /**
