@@ -111,6 +111,11 @@ void SmacPlannerHybrid::configure(
   _search_info.downsample_obstacle_heuristic =
     node->declare_or_get_parameter(name + ".downsample_obstacle_heuristic", true);
 
+  _search_info.allow_goal_overshoot =
+    node->declare_or_get_parameter(name + ".allow_goal_overshoot", false);
+  _search_info.goal_align_distance =
+    node->declare_or_get_parameter(name + ".goal_align_distance", 0.0);
+
   analytic_expansion_max_length_m =
     node->declare_or_get_parameter(name + ".analytic_expansion_max_length", 3.0);
   _search_info.analytic_expansion_max_length =
@@ -136,7 +141,6 @@ void SmacPlannerHybrid::configure(
       "Valid options are DEFAULT, BIDIRECTIONAL, ALL_DIRECTION. ";
     throw nav2_core::PlannerException(error_msg);
   }
-
   _motion_model = fromString(_motion_model_for_search);
 
   if (_motion_model == MotionModel::UNKNOWN) {
@@ -237,6 +241,7 @@ void SmacPlannerHybrid::configure(
     node, _global_frame, topic_name, _costmap, _downsampling_factor);
 
   _raw_plan_publisher = node->create_publisher<nav_msgs::msg::Path>("unsmoothed_plan");
+  _collision_map_publisher = node->create_publisher<nav_msgs::msg::OccupancyGrid>("collision_map");
 
   if (_debug_visualizations) {
     _expansions_publisher = node->create_publisher<geometry_msgs::msg::PoseArray>("expansions");
@@ -262,6 +267,7 @@ void SmacPlannerHybrid::activate()
     _logger, "Activating plugin %s of type SmacPlannerHybrid",
     _name.c_str());
   _raw_plan_publisher->on_activate();
+  _collision_map_publisher->on_activate();
   if (_debug_visualizations) {
     _expansions_publisher->on_activate();
     _planned_footprints_publisher->on_activate();
@@ -297,6 +303,7 @@ void SmacPlannerHybrid::deactivate()
     _logger, "Deactivating plugin %s of type SmacPlannerHybrid",
     _name.c_str());
   _raw_plan_publisher->on_deactivate();
+  _collision_map_publisher->on_deactivate();
   if (_debug_visualizations) {
     _expansions_publisher->on_deactivate();
     _planned_footprints_publisher->on_deactivate();
@@ -329,6 +336,7 @@ void SmacPlannerHybrid::cleanup()
     _costmap_downsampler.reset();
   }
   _raw_plan_publisher.reset();
+  _collision_map_publisher.reset();
   if (_debug_visualizations) {
     _expansions_publisher.reset();
     _planned_footprints_publisher.reset();
@@ -365,6 +373,187 @@ nav_msgs::msg::Path SmacPlannerHybrid::createPlan(
     _costmap_ros->getUseRadius(),
     findCircumscribedCost(_costmap_ros));
   _a_star->setCollisionChecker(&_collision_checker);
+
+  // Set search bounds if overshoot is disabled
+  if (!_search_info.allow_goal_overshoot) {
+    _search_info.setSearchBound(goal.pose);
+    _search_info.setStart(start.pose.position);
+    _a_star->setSearchBounds(goal.pose, start.pose.position, _search_info.allow_goal_overshoot);
+  }
+
+  // Compute waypoints for goal alignment
+  auto waypoints = computeWaypoints(start, goal, _tolerance);
+
+  nav_msgs::msg::Path plan;
+
+  if (waypoints.empty()) {
+    // No waypoint, plan directly
+    plan = getPath(start, goal, cancel_checker);
+  } else if (waypoints.size() == 1) {
+    // Single waypoint
+    plan = planWithWaypoint(start, waypoints[0], goal, cancel_checker);
+  } else {
+    // Two waypoints - pick the one with shorter path
+    nav_msgs::msg::Path plan1 = planWithWaypoint(start, waypoints[0], goal, cancel_checker);
+    nav_msgs::msg::Path plan2 = planWithWaypoint(start, waypoints[1], goal, cancel_checker);
+
+    if (plan1.poses.empty() && plan2.poses.empty()) {
+      throw nav2_core::NoValidPathCouldBeFound(
+              "Could not plan to either of the goal align poses");
+    }
+
+    auto pathLength = [](const nav_msgs::msg::Path & p) {
+        double len = 0.0;
+        for (size_t i = 1; i < p.poses.size(); ++i) {
+          len += std::hypot(
+            p.poses[i].pose.position.x - p.poses[i - 1].pose.position.x,
+            p.poses[i].pose.position.y - p.poses[i - 1].pose.position.y);
+        }
+        return len;
+      };
+
+    if (!plan1.poses.empty() &&
+      (plan2.poses.empty() || pathLength(plan1) <= pathLength(plan2)))
+    {
+      plan = plan1;
+    } else {
+      plan = plan2;
+    }
+  }
+
+  if (plan.poses.empty()) {
+    throw nav2_core::NoValidPathCouldBeFound("no valid path found");
+  }
+
+  // Find how much time we have left to do smoothing
+  steady_clock::time_point b = steady_clock::now();
+  duration<double> time_span = duration_cast<duration<double>>(b - a);
+  double time_remaining = _max_planning_time - static_cast<double>(time_span.count());
+
+  // Smooth plan
+  if (_smoother && plan.poses.size() > 2) {
+    _smoother->smooth(plan, costmap, time_remaining);
+  }
+
+  if (_debug_visualizations) {
+    if (_smoothed_footprints_publisher->get_subscription_count() > 0) {
+      auto marker_array = std::make_unique<visualization_msgs::msg::MarkerArray>();
+      visualization_msgs::msg::Marker clear_all_marker;
+      clear_all_marker.action = visualization_msgs::msg::Marker::DELETEALL;
+      marker_array->markers.push_back(clear_all_marker);
+      _smoothed_footprints_publisher->publish(std::move(marker_array));
+
+      marker_array = std::make_unique<visualization_msgs::msg::MarkerArray>();
+      auto now = _clock->now();
+      for (size_t i = 0; i < plan.poses.size(); i++) {
+        const std::vector<geometry_msgs::msg::Point> edge =
+          transformFootprintToEdges(plan.poses[i].pose, _costmap_ros->getRobotFootprint());
+        marker_array->markers.push_back(createMarker(edge, i, _global_frame, now));
+      }
+      _smoothed_footprints_publisher->publish(std::move(marker_array));
+    }
+  }
+
+  return plan;
+}
+
+std::vector<geometry_msgs::msg::PoseStamped> SmacPlannerHybrid::computeWaypoints(
+  const geometry_msgs::msg::PoseStamped & start,
+  const geometry_msgs::msg::PoseStamped & goal,
+  float tolerance)
+{
+  if (_search_info.goal_align_distance <= 0.0f) {
+    return {};
+  }
+
+  geometry_msgs::msg::PoseStamped waypoint_front, waypoint_back;
+  waypoint_front.header = goal.header;
+  waypoint_back.header = goal.header;
+  waypoint_front.pose =
+    getPoseAtDistanceAlongHeading(goal.pose, _search_info.goal_align_distance);
+  waypoint_back.pose =
+    getPoseAtDistanceAlongHeading(goal.pose, -_search_info.goal_align_distance);
+
+  if (isSamePose(goal.pose, waypoint_front.pose, tolerance)) {
+    return {};
+  }
+
+  // If overshoot not allowed, pick the waypoint on the same side as start
+  if (!_search_info.allow_goal_overshoot) {
+    if (_search_info.isStartBehindSearchBounds()) {
+      return {waypoint_back};
+    } else {
+      return {waypoint_front};
+    }
+  }
+
+  // Allow overshoot - return both waypoints to compare
+  return {waypoint_front, waypoint_back};
+}
+
+nav_msgs::msg::Path SmacPlannerHybrid::planWithWaypoint(
+  const geometry_msgs::msg::PoseStamped & start,
+  const geometry_msgs::msg::PoseStamped & waypoint,
+  const geometry_msgs::msg::PoseStamped & goal,
+  std::function<bool()> cancel_checker)
+{
+  nav_msgs::msg::Path empty_path;
+  empty_path.header.stamp = _clock->now();
+  empty_path.header.frame_id = _global_frame;
+
+  // Set bounds for waypoint->goal segment if overshoot is disabled
+  if (!_search_info.allow_goal_overshoot) {
+    _search_info.setSearchBound(goal.pose);
+    _search_info.setStart(waypoint.pose.position);
+    _a_star->setSearchBounds(
+      goal.pose, waypoint.pose.position, _search_info.allow_goal_overshoot);
+  }
+
+  // Plan waypoint -> goal with straight path mode
+  _a_star->setSearchStraightPathFlag(true);
+  nav_msgs::msg::Path segment2 = getPath(waypoint, goal, cancel_checker);
+  _a_star->setSearchStraightPathFlag(false);
+
+  if (segment2.poses.empty()) {
+    return empty_path;
+  }
+
+  // Set bounds for start->waypoint segment
+  if (!_search_info.allow_goal_overshoot) {
+    const bool is_robot_between = isBetweenPoints(start.pose, waypoint.pose, goal.pose);
+    if (!is_robot_between) {
+      _search_info.setSearchBound(waypoint.pose);
+      _search_info.setStart(start.pose.position);
+      _a_star->setSearchBounds(
+        waypoint.pose, start.pose.position, _search_info.allow_goal_overshoot);
+    }
+  }
+
+  // Plan start -> waypoint
+  nav_msgs::msg::Path segment1 = getPath(start, waypoint, cancel_checker);
+
+  if (segment1.poses.empty()) {
+    return empty_path;
+  }
+
+  // Combine segments
+  nav_msgs::msg::Path combined;
+  combined.header = segment1.header;
+  combined.poses = segment1.poses;
+  // Avoid duplicating the waypoint pose
+  if (!combined.poses.empty() && !segment2.poses.empty()) {
+    combined.poses.insert(
+      combined.poses.end(), segment2.poses.begin() + 1, segment2.poses.end());
+  }
+  return combined;
+}
+
+nav_msgs::msg::Path SmacPlannerHybrid::getPath(
+  const geometry_msgs::msg::PoseStamped & start,
+  const geometry_msgs::msg::PoseStamped & goal,
+  std::function<bool()> cancel_checker)
+{
+  nav2_costmap_2d::Costmap2D * costmap = _collision_checker.getCostmap();
 
   // Set starting point, in A* bin search coordinates
   float mx_start, my_start, mx_goal, my_goal;
@@ -459,7 +648,7 @@ nav_msgs::msg::Path SmacPlannerHybrid::createPlan(
       path, num_iterations,
       _tolerance / static_cast<float>(costmap->getResolution()), cancel_checker, expansions.get()))
   {
-    if (_debug_visualizations) {
+    if (_debug_visualizations && expansions) {
       auto msg = std::make_unique<geometry_msgs::msg::PoseArray>();
       geometry_msgs::msg::Pose msg_pose;
       msg->header.stamp = _clock->now();
@@ -473,16 +662,13 @@ nav_msgs::msg::Path SmacPlannerHybrid::createPlan(
       _expansions_publisher->publish(std::move(msg));
     }
 
-    // Note: If the start is blocked only one iteration will occur before failure
+    // Publish collision map if start is blocked
     if (num_iterations == 1) {
-      throw nav2_core::StartOccupied("Start occupied");
+      publishCollisionMap(start.pose);
     }
 
-    if (num_iterations < _a_star->getMaxIterations()) {
-      throw nav2_core::NoValidPathCouldBeFound("no valid path found");
-    } else {
-      throw nav2_core::PlannerTimedOut("exceeded maximum iterations");
-    }
+    // Return empty path to indicate failure
+    return plan;
   }
 
   // Convert to world coordinates
@@ -533,50 +719,92 @@ nav_msgs::msg::Path SmacPlannerHybrid::createPlan(
     }
   }
 
-  // Find how much time we have left to do smoothing
-  steady_clock::time_point b = steady_clock::now();
-  duration<double> time_span = duration_cast<duration<double>>(b - a);
-  double time_remaining = _max_planning_time - static_cast<double>(time_span.count());
+  return plan;
+}
 
-#ifdef BENCHMARK_TESTING
-  std::cout << "It took " << time_span.count() * 1000 <<
-    " milliseconds with " << num_iterations << " iterations." << std::endl;
-#endif
-
-  // Smooth plan
-  if (_smoother && num_iterations > 1) {
-    _smoother->smooth(plan, costmap, time_remaining);
+void SmacPlannerHybrid::publishCollisionMap(const geometry_msgs::msg::Pose & robot_pose)
+{
+  if (_collision_map_publisher->get_subscription_count() == 0) {
+    return;
   }
 
-#ifdef BENCHMARK_TESTING
-  steady_clock::time_point c = steady_clock::now();
-  duration<double> time_span2 = duration_cast<duration<double>>(c - b);
-  std::cout << "It took " << time_span2.count() * 1000 <<
-    " milliseconds to smooth path." << std::endl;
-#endif
+  nav2_costmap_2d::Costmap2D * costmap = _costmap;
+  const double yaw = tf2::getYaw(robot_pose.orientation);
+  const auto footprint = _costmap_ros->getRobotFootprint();
 
-  if (_debug_visualizations) {
-    if (_smoothed_footprints_publisher->get_subscription_count() > 0) {
-      // Clear all markers first
-      auto marker_array = std::make_unique<visualization_msgs::msg::MarkerArray>();
-      visualization_msgs::msg::Marker clear_all_marker;
-      clear_all_marker.action = visualization_msgs::msg::Marker::DELETEALL;
-      marker_array->markers.push_back(clear_all_marker);
-      _smoothed_footprints_publisher->publish(std::move(marker_array));
+  // Get footprint cells using the costmap's polygon fill
+  unsigned int mx, my;
+  if (!costmap->worldToMap(robot_pose.position.x, robot_pose.position.y, mx, my)) {
+    return;
+  }
 
-      // Publish smoothed footprints for debug
-      marker_array = std::make_unique<visualization_msgs::msg::MarkerArray>();
-      auto now = _clock->now();
-      for (size_t i = 0; i < plan.poses.size(); i++) {
-        const std::vector<geometry_msgs::msg::Point> edge =
-          transformFootprintToEdges(plan.poses[i].pose, _costmap_ros->getRobotFootprint());
-        marker_array->markers.push_back(createMarker(edge, i, _global_frame, now));
-      }
-      _smoothed_footprints_publisher->publish(std::move(marker_array));
+  // Transform footprint to world then to map cells
+  std::vector<nav2_costmap_2d::MapLocation> map_polygon;
+  for (const auto & pt : footprint) {
+    double wx = robot_pose.position.x + pt.x * std::cos(yaw) - pt.y * std::sin(yaw);
+    double wy = robot_pose.position.y + pt.x * std::sin(yaw) + pt.y * std::cos(yaw);
+    unsigned int cell_x, cell_y;
+    if (costmap->worldToMap(wx, wy, cell_x, cell_y)) {
+      map_polygon.push_back({cell_x, cell_y});
     }
   }
 
-  return plan;
+  if (map_polygon.empty()) {
+    return;
+  }
+
+  std::vector<nav2_costmap_2d::MapLocation> polygon_cells;
+  costmap->convexFillCells(map_polygon, polygon_cells);
+
+  long min_x = costmap->getSizeInCellsX();
+  long max_x = 0;
+  long min_y = costmap->getSizeInCellsY();
+  long max_y = 0;
+
+  std::vector<std::pair<int, int>> colliding_cells;
+  for (const auto & cell : polygon_cells) {
+    unsigned char cost = costmap->getCost(cell.x, cell.y);
+    if (cost == nav2_costmap_2d::LETHAL_OBSTACLE ||
+      (!_allow_unknown && cost == nav2_costmap_2d::NO_INFORMATION))
+    {
+      colliding_cells.emplace_back(cell.x, cell.y);
+      min_x = std::min(min_x, static_cast<long>(cell.x));
+      max_x = std::max(max_x, static_cast<long>(cell.x));
+      min_y = std::min(min_y, static_cast<long>(cell.y));
+      max_y = std::max(max_y, static_cast<long>(cell.y));
+    }
+  }
+
+  if (colliding_cells.empty()) {
+    return;
+  }
+
+  const int width = max_x - min_x + 3;
+  const int height = max_y - min_y + 3;
+
+  nav_msgs::msg::OccupancyGrid grid;
+  grid.header.stamp = _clock->now();
+  grid.header.frame_id = _global_frame;
+  grid.info.resolution = costmap->getResolution();
+  grid.info.width = width;
+  grid.info.height = height;
+
+  double origin_x, origin_y;
+  costmap->mapToWorld(min_x, min_y, origin_x, origin_y);
+  grid.info.origin.position.x = origin_x - grid.info.resolution / 2.0;
+  grid.info.origin.position.y = origin_y - grid.info.resolution / 2.0;
+  grid.info.origin.orientation.w = 1.0;
+
+  grid.data.resize(width * height, 0);
+
+  for (const auto & cell : colliding_cells) {
+    const int local_x = cell.first - min_x;
+    const int local_y = cell.second - min_y;
+    const size_t index = local_x + local_y * width;
+    grid.data[index] = 100;
+  }
+
+  _collision_map_publisher->publish(grid);
 }
 
 rcl_interfaces::msg::SetParametersResult SmacPlannerHybrid::validateParameterUpdatesCallback(
