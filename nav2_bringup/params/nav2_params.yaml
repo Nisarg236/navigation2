@@ -400,6 +400,15 @@ planner_server:
       use_astar: false
       max_cycles_factor: 4
       allow_unknown: true
+      # Corridor radius [m] around the route through a request's viapoints. When positive, the
+      # whole route is planned in one call and the path may stray from it by at most this much,
+      # so the viapoints guide the path instead of being poses it has to pass through. 0 keeps
+      # the legacy behavior: viapoints are ignored and ComputePathThroughPoses plans leg by leg.
+      max_route_deviation: 0.0
+      # Extra cost at the corridor wall, ramped from 0 on the route. Keeps the path off the wall
+      # so it stays smooth; the corridor bound does not depend on it. Values much above 40 start
+      # to interact with obstacle inflation.
+      route_deviation_weight: 0.0
 
 smoother_server:
   ros__parameters:

@@ -41,6 +41,14 @@ struct Parameters
   bool use_astar;
   // Integer factor applied to the largest costmap dimension to limit path extraction cycles
   int max_cycles_factor;
+  // Corridor radius [m] around the route through the requested viapoints. When positive the
+  // search is confined to the cells within this distance of that route, so the path cannot
+  // stray further from any leg of it. 0 disables corridor planning and viapoints are ignored.
+  double max_route_deviation;
+  // Extra cost at the corridor wall, ramped quadratically from 0 on the route. Keeps the path
+  // off the hard wall so NavFn stays in gradient mode; the corridor bound does not depend on
+  // it. Values much above 40 start to interact with obstacle inflation.
+  double route_deviation_weight;
 };
 
 /**

@@ -72,6 +72,14 @@ public:
    * @param cancel_checker A function to check if the action has been canceled
    * @return Path
    */
+  /**
+   * @brief Look up a loaded planner by its id, falling back to the only loaded planner when the
+   *        id is empty, as the actions allow
+   * @param planner_id Name of the planner requested
+   * @return the planner, or nullptr when the id names no loaded planner
+   */
+  nav2_core::GlobalPlanner::Ptr findPlanner(const std::string & planner_id);
+
   nav_msgs::msg::Path getPlan(
     const geometry_msgs::msg::PoseStamped & start,
     const geometry_msgs::msg::PoseStamped & goal,

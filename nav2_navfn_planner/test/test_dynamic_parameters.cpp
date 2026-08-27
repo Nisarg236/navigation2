@@ -45,7 +45,9 @@ TEST(NavfnTest, testDynamicParameter)
       rclcpp::Parameter("test.use_astar", true),
       rclcpp::Parameter("test.max_cycles_factor", 6),
       rclcpp::Parameter("test.allow_unknown", true),
-      rclcpp::Parameter("test.use_final_approach_orientation", true)});
+      rclcpp::Parameter("test.use_final_approach_orientation", true),
+      rclcpp::Parameter("test.max_route_deviation", 1.5),
+      rclcpp::Parameter("test.route_deviation_weight", 20.0)});
 
   rclcpp::spin_until_future_complete(
     node->get_node_base_interface(),
@@ -56,6 +58,8 @@ TEST(NavfnTest, testDynamicParameter)
   EXPECT_EQ(node->get_parameter("test.max_cycles_factor").as_int(), 6);
   EXPECT_EQ(node->get_parameter("test.allow_unknown").as_bool(), true);
   EXPECT_EQ(node->get_parameter("test.use_final_approach_orientation").as_bool(), true);
+  EXPECT_EQ(node->get_parameter("test.max_route_deviation").as_double(), 1.5);
+  EXPECT_EQ(node->get_parameter("test.route_deviation_weight").as_double(), 20.0);
 
   results = rec_param->set_parameters_atomically(
     {rclcpp::Parameter("test.tolerance", -1.0)});

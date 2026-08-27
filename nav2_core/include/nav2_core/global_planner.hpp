@@ -80,6 +80,17 @@ public:
     const geometry_msgs::msg::PoseStamped & goal,
     const std::vector<geometry_msgs::msg::PoseStamped> & viapoints,
     std::function<bool()> cancel_checker) = 0;
+
+  /**
+   * @brief Whether this planner makes use of the viapoints given to createPlan().
+   *
+   * A planner that returns true is handed every checkpoint of a request in one call, so it can
+   * plan a single path along the whole route. Planners that return false are asked for one leg
+   * at a time, as before, and may ignore the viapoints argument.
+   *
+   * @return true if createPlan() honours its viapoints argument
+   */
+  virtual bool supportsViapoints() const {return false;}
 };
 
 }  // namespace nav2_core

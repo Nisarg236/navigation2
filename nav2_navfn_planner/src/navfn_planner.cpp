@@ -23,8 +23,10 @@
 
 #include "nav2_navfn_planner/navfn_planner.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -128,12 +130,13 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
   steady_clock::time_point a = steady_clock::now();
 #endif
 
-  if (!viapoints.empty()) {
-    RCLCPP_WARN(logger_, "Received %zu viapoints, but this planner ignores them",
-      viapoints.size());
-  }
-
   std::lock_guard<std::mutex> lock_reinit(param_handler_->getMutex());
+
+  const double corridor_radius = params_->max_route_deviation;
+  if (!viapoints.empty() && corridor_radius <= 0.0) {
+    RCLCPP_WARN(logger_, "Received %zu viapoints, but this planner ignores them unless "
+      "max_route_deviation is set", viapoints.size());
+  }
   unsigned int mx_start, my_start, mx_goal, my_goal;
   if (!costmap_->worldToMap(start.pose.position.x, start.pose.position.y, mx_start, my_start)) {
     throw nav2_core::StartOutsideMapBounds(
@@ -145,6 +148,20 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
     throw nav2_core::GoalOutsideMapBounds(
             "Goal Coordinates of(" + std::to_string(goal.pose.position.x) + ", " +
             std::to_string(goal.pose.position.y) + ") was outside bounds");
+  }
+
+  if (corridor_radius > 0.0) {
+    unsigned int mx_via, my_via;
+    for (size_t i = 0; i != viapoints.size(); i++) {
+      if (!costmap_->worldToMap(
+          viapoints[i].pose.position.x, viapoints[i].pose.position.y, mx_via, my_via))
+      {
+        throw nav2_core::GoalOutsideMapBounds(
+                "Viapoint " + std::to_string(i) + " of(" +
+                std::to_string(viapoints[i].pose.position.x) + ", " +
+                std::to_string(viapoints[i].pose.position.y) + ") was outside bounds");
+      }
+    }
   }
 
   if (params_->tolerance == 0 && costmap_->getCost(mx_goal,
@@ -187,7 +204,23 @@ nav_msgs::msg::Path NavfnPlanner::createPlan(
     return path;
   }
 
-  if (!makePlan(start.pose, goal.pose, params_->tolerance, cancel_checker, path)) {
+  if (corridor_radius > 0.0) {
+    // The corridor is built around a route that starts at the robot, so the robot is always
+    // inside it even after drifting off, and the way back onto the route is inside it too
+    std::vector<geometry_msgs::msg::Pose> route;
+    route.reserve(viapoints.size() + 2);
+    route.push_back(start.pose);
+    for (const auto & viapoint : viapoints) {
+      route.push_back(viapoint.pose);
+    }
+    route.push_back(goal.pose);
+
+    if (!makePlan(route, params_->tolerance, corridor_radius, cancel_checker, path)) {
+      throw nav2_core::CorridorInfeasible(
+              "Failed to find a path to the goal within " + std::to_string(corridor_radius) +
+              " m of the route");
+    }
+  } else if (!makePlan(start.pose, goal.pose, params_->tolerance, cancel_checker, path)) {
     throw nav2_core::NoValidPathCouldBeFound(
             "Failed to create plan with tolerance of: " + std::to_string(params_->tolerance) );
   }
@@ -221,6 +254,20 @@ NavfnPlanner::makePlan(
   std::function<bool()> cancel_checker,
   nav_msgs::msg::Path & plan)
 {
+  return makePlan(
+    std::vector<geometry_msgs::msg::Pose>{start, goal}, tolerance, 0.0, cancel_checker, plan);
+}
+
+bool
+NavfnPlanner::makePlan(
+  const std::vector<geometry_msgs::msg::Pose> & route, double tolerance,
+  double corridor_radius,
+  std::function<bool()> cancel_checker,
+  nav_msgs::msg::Path & plan)
+{
+  const geometry_msgs::msg::Pose & start = route.front();
+  const geometry_msgs::msg::Pose & goal = route.back();
+
   // clear the plan, just in case
   plan.poses.clear();
 
@@ -247,7 +294,11 @@ NavfnPlanner::makePlan(
     costmap_->getSizeInCellsX(),
     costmap_->getSizeInCellsY());
 
-  planner_->setCostmap(costmap_->getCharMap(), true, params_->allow_unknown);
+  if (corridor_radius > 0.0) {
+    setCostmapWithCorridor(route, corridor_radius);
+  } else {
+    planner_->setCostmap(costmap_->getCharMap(), true, params_->allow_unknown);
+  }
 
   lock.unlock();
 
@@ -345,6 +396,95 @@ NavfnPlanner::makePlan(
   }
 
   return !plan.poses.empty();
+}
+
+void
+NavfnPlanner::setCostmapWithCorridor(
+  const std::vector<geometry_msgs::msg::Pose> & route, double radius)
+{
+  const COSTTYPE * cmap = costmap_->getCharMap();
+  COSTTYPE * costarr = planner_->costarr;
+  const int nx = planner_->nx;
+  const int ny = planner_->ny;
+  const double res = costmap_->getResolution();
+  const double origin_x = costmap_->getOriginX();
+  const double origin_y = costmap_->getOriginY();
+
+  // The corridor around a route is not convex at the bends, so a path pose interpolated
+  // between allowed cells can sit up to about one cell outside them. Masking one cell short of
+  // the requested radius keeps every returned pose inside the corridor.
+  const double masked_radius = std::max(radius - res, res);
+  const double radius_sq = masked_radius * masked_radius;
+
+  // Everything outside the corridor is forbidden. Only the cells inside it are then translated
+  // from costmap values, which is less work than the full-map pass in NavFn::setCostmap(), and
+  // it keeps the wavefront from ever leaving the corridor.
+  std::memset(costarr, COST_OBS, planner_->ns);
+
+  for (size_t leg = 0; leg + 1 < route.size(); leg++) {
+    const double ax = route[leg].position.x;
+    const double ay = route[leg].position.y;
+    const double dx = route[leg + 1].position.x - ax;
+    const double dy = route[leg + 1].position.y - ay;
+    const double length_sq = dx * dx + dy * dy;
+    // A zero length leg degenerates to a disc around the pose, which is what we want
+    const double inv_length_sq = length_sq > 0.0 ? 1.0 / length_sq : 0.0;
+
+    const double pad = masked_radius + res;
+    const int i0 = std::max(
+      0, static_cast<int>(std::floor((std::min(ax, ax + dx) - pad - origin_x) / res)));
+    const int i1 = std::min(
+      nx - 1, static_cast<int>(std::ceil((std::max(ax, ax + dx) + pad - origin_x) / res)));
+    const int j0 = std::max(
+      0, static_cast<int>(std::floor((std::min(ay, ay + dy) - pad - origin_y) / res)));
+    const int j1 = std::min(
+      ny - 1, static_cast<int>(std::ceil((std::max(ay, ay + dy) + pad - origin_y) / res)));
+
+    for (int j = j0; j <= j1; j++) {
+      // Matches mapToWorld(), so the bound holds in the coordinates the path is reported in
+      const double wy = origin_y + j * res;
+      for (int i = i0; i <= i1; i++) {
+        const double wx = origin_x + i * res;
+
+        // Squared distance from the cell to this leg, no square roots needed
+        const double pax = wx - ax;
+        const double pay = wy - ay;
+        const double t = std::clamp((pax * dx + pay * dy) * inv_length_sq, 0.0, 1.0);
+        const double ex = pax - t * dx;
+        const double ey = pay - t * dy;
+        const double distance_sq = ex * ex + ey * ey;
+        if (distance_sq > radius_sq) {
+          continue;  // outside the corridor, stays forbidden
+        }
+
+        // Same translation of costmap values as NavFn::setCostmap()
+        const int k = i + j * nx;
+        int v = cmap[k];
+        if (v < COST_OBS_ROS) {
+          v = COST_NEUTRAL + COST_FACTOR * v;
+          if (v >= COST_OBS) {
+            v = COST_OBS - 1;
+          }
+        } else if (v == COST_UNKNOWN_ROS && params_->allow_unknown) {
+          v = COST_OBS - 1;
+        } else {
+          continue;  // lethal or inscribed, leave it forbidden
+        }
+
+        if (params_->route_deviation_weight > 0.0) {
+          v += static_cast<int>(params_->route_deviation_weight * distance_sq / radius_sq);
+          if (v >= COST_OBS) {
+            v = COST_OBS - 1;
+          }
+        }
+
+        // Legs overlap around the viapoints; keep the cheaper of the two
+        if (v < costarr[k]) {
+          costarr[k] = static_cast<COSTTYPE>(v);
+        }
+      }
+    }
+  }
 }
 
 void

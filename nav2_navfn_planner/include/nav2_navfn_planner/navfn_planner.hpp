@@ -92,6 +92,12 @@ public:
     const std::vector<geometry_msgs::msg::PoseStamped> & viapoints,
     std::function<bool()> cancel_checker) override;
 
+  /**
+   * @brief Whether the viapoints of a request are honoured
+   * @return true when a corridor radius is configured, so the whole route can be planned at once
+   */
+  bool supportsViapoints() const override {return params_->max_route_deviation > 0.0;}
+
 protected:
   /**
    * @brief Compute a plan given start and goal poses, provided in global world frame.
@@ -107,6 +113,42 @@ protected:
     const geometry_msgs::msg::Pose & goal, double tolerance,
     std::function<bool()> cancel_checker,
     nav_msgs::msg::Path & plan);
+
+  /**
+   * @brief Compute a plan along a route of poses, provided in global world frame.
+   *
+   * The plan runs from the first to the last pose of the route. When corridor_radius is
+   * positive the search is confined to the cells within that distance of the route, so the
+   * path cannot stray further from any leg of it; the poses in between are otherwise
+   * unconstrained, guiding the path rather than being poses it has to pass through.
+   *
+   * @param route Start pose followed by the viapoints and the goal, at least two poses
+   * @param tolerance Relaxation constraint in x and y at the last pose
+   * @param corridor_radius Corridor radius [m]; 0 searches the whole costmap as usual
+   * @param cancel_checker Function to check if the task has been canceled
+   * @param plan Path to be computed
+   * @return true if can find the path
+   */
+  bool makePlan(
+    const std::vector<geometry_msgs::msg::Pose> & route, double tolerance,
+    double corridor_radius,
+    std::function<bool()> cancel_checker,
+    nav_msgs::msg::Path & plan);
+
+  /**
+   * @brief Fill the planner's own cost array from the costmap, forbidding every cell that lies
+   *        further than the corridor radius from the route.
+   *
+   * Replaces NavFn::setCostmap() when planning inside a corridor. Everything is marked
+   * forbidden with a single bulk write and only the cells inside the corridor are then
+   * translated from costmap values, so this visits fewer cells than the unmasked version and
+   * the wavefront cannot leave the corridor. Cells shared by two legs take the lower cost.
+   *
+   * @param route Start pose followed by the viapoints and the goal
+   * @param radius Corridor radius [m]
+   */
+  void setCostmapWithCorridor(
+    const std::vector<geometry_msgs::msg::Pose> & route, double radius);
 
   /**
    * @brief Compute the navigation function given a seed point in the world to start from

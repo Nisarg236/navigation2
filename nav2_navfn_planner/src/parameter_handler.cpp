@@ -42,6 +42,10 @@ ParameterHandler::ParameterHandler(
   params_.allow_unknown = node->declare_or_get_parameter(plugin_name + ".allow_unknown", true);
   params_.use_final_approach_orientation = node->declare_or_get_parameter(plugin_name +
     ".use_final_approach_orientation", false);
+  params_.max_route_deviation =
+    node->declare_or_get_parameter(plugin_name + ".max_route_deviation", 0.0);
+  params_.route_deviation_weight =
+    node->declare_or_get_parameter(plugin_name + ".route_deviation_weight", 0.0);
 }
 
 rcl_interfaces::msg::SetParametersResult ParameterHandler::validateParameterUpdatesCallback(
@@ -56,7 +60,10 @@ rcl_interfaces::msg::SetParametersResult ParameterHandler::validateParameterUpda
       continue;
     }
     if (param_type == ParameterType::PARAMETER_DOUBLE) {
-      if (parameter.as_double() <= 0.0) {
+      const bool zero_allowed =
+        param_name == plugin_name_ + ".max_route_deviation" ||
+        param_name == plugin_name_ + ".route_deviation_weight";
+      if (parameter.as_double() < 0.0 || (!zero_allowed && parameter.as_double() <= 0.0)) {
         RCLCPP_WARN(
         logger_, "The value of parameter '%s' is incorrectly set to %f, "
         "it should be >0. Ignoring parameter update.",
@@ -91,6 +98,10 @@ ParameterHandler::updateParametersCallback(
     if (param_type == ParameterType::PARAMETER_DOUBLE) {
       if (param_name == plugin_name_ + ".tolerance") {
         params_.tolerance = parameter.as_double();
+      } else if (param_name == plugin_name_ + ".max_route_deviation") {
+        params_.max_route_deviation = parameter.as_double();
+      } else if (param_name == plugin_name_ + ".route_deviation_weight") {
+        params_.route_deviation_weight = parameter.as_double();
       }
     } else if (param_type == ParameterType::PARAMETER_INTEGER) {
       if (param_name == plugin_name_ + ".max_cycles_factor") {

@@ -373,6 +373,7 @@ void PlannerServer::computePlanThroughPoses()
   RCLCPP_INFO(get_logger(), "Computing path through poses to goal.");
 
   geometry_msgs::msg::PoseStamped curr_start, curr_goal;
+  bool planned_along_route = false;
 
   try {
     if (isServerInactive<ActionThroughPoses>(action_server_poses_) ||
@@ -399,8 +400,41 @@ void PlannerServer::computePlanThroughPoses()
         return action_server_poses_->is_cancel_requested();
       };
 
+    // A planner that honours viapoints is given the whole route in one call, so it can plan a
+    // single path along it. The poses before the last then only guide the path instead of being
+    // poses it has to pass through, and no heading is forced at any of them.
+    auto planner = findPlanner(goal->planner_id);
+    if (planner && planner->supportsViapoints()) {
+      std::vector<geometry_msgs::msg::PoseStamped> viapoints(
+        goal->goals.goals.begin(), goal->goals.goals.end() - 1);
+      curr_start = start;
+      curr_goal = goal->goals.goals.back();
+
+      if (!transformPosesToGlobalFrame(curr_start, curr_goal)) {
+        throw nav2_core::PlannerTFError("Unable to transform poses to global frame");
+      }
+      // The helper transforms a pair, so pass the already transformed start alongside each
+      // viapoint as a throwaway copy
+      for (auto & viapoint : viapoints) {
+        geometry_msgs::msg::PoseStamped global_start = curr_start;
+        if (!transformPosesToGlobalFrame(global_start, viapoint)) {
+          throw nav2_core::PlannerTFError("Unable to transform poses to global frame");
+        }
+      }
+
+      concat_path = getPlan(curr_start, curr_goal, viapoints, goal->planner_id, cancel_checker);
+
+      if (!validatePath<ActionThroughPoses>(curr_goal, concat_path, goal->planner_id)) {
+        throw nav2_core::NoValidPathCouldBeFound(
+          goal->planner_id + " generated a empty path");
+      }
+
+      result->last_reached_index = ActionThroughPosesResult::ALL_GOALS;
+      planned_along_route = true;
+    }
+
     // Get consecutive paths through these points
-    for (unsigned int i = 0; i != goal->goals.goals.size(); i++) {
+    for (unsigned int i = 0; !planned_along_route && i != goal->goals.goals.size(); i++) {
       // Get starting point
       if (i == 0) {
         curr_start = start;
@@ -522,6 +556,10 @@ void PlannerServer::computePlanThroughPoses()
     exceptionWarning(curr_start, curr_goal, goal->planner_id, ex, result->error_msg);
     result->error_code = ActionThroughPosesResult::NO_VIAPOINTS_GIVEN;
     action_server_poses_->terminate_current(result);
+  } catch (nav2_core::CorridorInfeasible & ex) {
+    exceptionWarning(curr_start, curr_goal, goal->planner_id, ex, result->error_msg);
+    result->error_code = ActionThroughPosesResult::CORRIDOR_INFEASIBLE;
+    action_server_poses_->terminate_current(result);
   } catch (nav2_core::PlannerCancelled &) {
     result->error_msg = "Goal was canceled. Canceling planning action.";
     RCLCPP_INFO(get_logger(), "%s", result->error_msg.c_str());
@@ -636,6 +674,19 @@ PlannerServer::computePlan()
     result->error_code = ActionToPoseResult::UNKNOWN;
     action_server_pose_->terminate_current(result);
   }
+}
+
+nav2_core::GlobalPlanner::Ptr
+PlannerServer::findPlanner(const std::string & planner_id)
+{
+  auto it = planners_.find(planner_id);
+  if (it != planners_.end()) {
+    return it->second;
+  }
+  if (planners_.size() == 1 && planner_id.empty()) {
+    return planners_.begin()->second;
+  }
+  return nullptr;
 }
 
 nav_msgs::msg::Path

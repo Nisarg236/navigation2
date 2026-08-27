@@ -24,6 +24,7 @@ uint16 GOAL_OCCUPIED=306
 uint16 TIMEOUT=307
 uint16 NO_VALID_PATH=308
 uint16 NO_VIAPOINTS_GIVEN=309
+uint16 CORRIDOR_INFEASIBLE=310
 
 nav_msgs/Path path
 int16 last_reached_index -1

@@ -113,6 +113,13 @@ public:
   : PlannerException(description) {}
 };
 
+class CorridorInfeasible : public PlannerException
+{
+public:
+  explicit CorridorInfeasible(const std::string & description)
+  : PlannerException(description) {}
+};
+
 class PlannerCancelled : public PlannerException
 {
 public:
