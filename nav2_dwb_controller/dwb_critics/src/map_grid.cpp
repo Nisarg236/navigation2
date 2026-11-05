@@ -49,9 +49,62 @@ namespace dwb_critics
 {
 
 // Customization of the CostmapQueue validCellToQueue method
-bool MapGridCritic::MapGridQueue::validCellToQueue(const costmap_queue::CellData & /*cell*/)
+bool MapGridCritic::MapGridQueue::validCellToQueue(const costmap_queue::CellData & cell)
 {
+  if (!avoid_obstacles_) {
+    return true;
+  }
+  const unsigned char cost = costmap_.getCost(cell.x_, cell.y_);
+  if (cost == nav2_costmap_2d::LETHAL_OBSTACLE ||
+    cost == nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE ||
+    cost == nav2_costmap_2d::NO_INFORMATION)
+  {
+    parent_.setAsObstacle(cell.index_);
+    return false;
+  }
   return true;
+}
+
+void MapGridCritic::MapGridQueue::reset()
+{
+  costmap_queue::CostmapQueue::reset();
+  avoid_obstacles_ = false;
+}
+
+CellData MapGridCritic::MapGridQueue::getNextCellAroundObstacles()
+{
+  const CellData current = front();
+  pop();
+
+  if (!validCellToQueue(current)) {
+    return current;
+  }
+
+  const unsigned int size_x = costmap_.getSizeInCellsX();
+  if (current.x_ > 0) {
+    enqueueNeighbor(current, current.index_ - 1, current.x_ - 1, current.y_);
+  }
+  if (current.y_ > 0) {
+    enqueueNeighbor(current, current.index_ - size_x, current.x_, current.y_ - 1);
+  }
+  if (current.x_ < size_x - 1) {
+    enqueueNeighbor(current, current.index_ + 1, current.x_ + 1, current.y_);
+  }
+  if (current.y_ < costmap_.getSizeInCellsY() - 1) {
+    enqueueNeighbor(current, current.index_ + size_x, current.x_, current.y_ + 1);
+  }
+  return current;
+}
+
+void MapGridCritic::MapGridQueue::enqueueNeighbor(
+  const CellData & from, unsigned int index, unsigned int x, unsigned int y)
+{
+  if (seen_[index]) {
+    return;
+  }
+  seen_[index] = true;
+  const double distance = from.distance_ + 1.0;
+  enqueue(distance, CellData(distance, index, x, y, from.src_x_, from.src_y_));
 }
 
 void MapGridCritic::onInit()
@@ -84,6 +137,9 @@ void MapGridCritic::onInit()
       aggro_str.c_str());
     aggregationType_ = ScoreAggregationType::Last;
   }
+
+  obstacle_aware_propagation_ = node->declare_or_get_parameter(
+    dwb_plugin_name_ + "." + name_ + ".obstacle_aware_propagation", false);
 }
 
 void MapGridCritic::setAsObstacle(unsigned int index)
@@ -107,6 +163,53 @@ void MapGridCritic::propagateManhattanDistances()
     cell_values_[cell.index_] = CellData::absolute_difference(cell.src_x_, cell.x_) +
       CellData::absolute_difference(cell.src_y_, cell.y_);
   }
+}
+
+void MapGridCritic::propagateDistances(const geometry_msgs::msg::Pose & robot_pose)
+{
+  if (!obstacle_aware_propagation_) {
+    propagateManhattanDistances();
+    return;
+  }
+
+  std::vector<unsigned int> seeds;
+  for (unsigned int i = 0; i < cell_values_.size(); ++i) {
+    if (cell_values_[i] == 0.0) {
+      seeds.push_back(i);
+    }
+  }
+
+  queue_->setAvoidObstacles(true);
+  if (propagateAroundObstacles(robot_pose)) {
+    return;
+  }
+
+  RCLCPP_DEBUG_THROTTLE(
+    rclcpp::get_logger("MapGridCritic"), *costmap_ros_->get_clock(), 1000,
+    "%s: the robot is not reachable around obstacles, falling back to Manhattan distances.",
+    name_.c_str());
+  reset();
+  for (const unsigned int index : seeds) {
+    unsigned int x, y;
+    costmap_->indexToCells(index, x, y);
+    cell_values_[index] = 0.0;
+    queue_->enqueueCell(x, y);
+  }
+  propagateManhattanDistances();
+}
+
+bool MapGridCritic::propagateAroundObstacles(const geometry_msgs::msg::Pose & robot_pose)
+{
+  while (!queue_->isEmpty()) {
+    const costmap_queue::CellData cell = queue_->getNextCellAroundObstacles();
+    if (cell_values_[cell.index_] != obstacle_score_) {
+      cell_values_[cell.index_] = cell.distance_;
+    }
+  }
+
+  unsigned int robot_x, robot_y;
+  return costmap_->worldToMap(robot_pose.position.x, robot_pose.position.y, robot_x, robot_y) &&
+         getScore(robot_x, robot_y) < obstacle_score_;
 }
 
 double MapGridCritic::scoreTrajectory(const dwb_msgs::msg::Trajectory2D & traj)
