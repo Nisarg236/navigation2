@@ -49,10 +49,10 @@ void LimitedAccelGenerator::initialize(
   plugin_name_ = plugin_name;
   StandardTrajectoryGenerator::initialize(nh, plugin_name_);
 
-  double default_sim_period = 0.05;
+  double sim_period = 0.05;
   const double controller_frequency = nh->declare_or_get_parameter("controller_frequency", 20.0);
   if (controller_frequency > 0) {
-    default_sim_period = 1.0 / controller_frequency;
+    sim_period = 1.0 / controller_frequency;
   } else {
     RCLCPP_WARN(
       rclcpp::get_logger("LimitedAccelGenerator"),
@@ -60,7 +60,7 @@ void LimitedAccelGenerator::initialize(
       "Ignoring the parameter, assuming a rate of 20Hz");
   }
   acceleration_time_ = nh->declare_or_get_parameter(
-    plugin_name + ".sim_period", default_sim_period);
+    plugin_name + ".sim_period", sim_period);
 }
 
 void LimitedAccelGenerator::startNewIteration(const nav_2d_msgs::msg::Twist2D & current_velocity)
