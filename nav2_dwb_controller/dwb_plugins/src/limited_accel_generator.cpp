@@ -49,24 +49,18 @@ void LimitedAccelGenerator::initialize(
   plugin_name_ = plugin_name;
   StandardTrajectoryGenerator::initialize(nh, plugin_name_);
 
-  try {
-    acceleration_time_ = nh->declare_or_get_parameter<double>(
-      plugin_name + ".sim_period");
-  } catch (std::exception &) {
+  double default_sim_period = 0.05;
+  const double controller_frequency = nh->declare_or_get_parameter("controller_frequency", 20.0);
+  if (controller_frequency > 0) {
+    default_sim_period = 1.0 / controller_frequency;
+  } else {
     RCLCPP_WARN(
       rclcpp::get_logger("LimitedAccelGenerator"),
-      "'sim_period' parameter is not set for %s", plugin_name.c_str());
-    double controller_frequency = nh->declare_or_get_parameter("controller_frequency", 20.0);
-    if (controller_frequency > 0) {
-      acceleration_time_ = 1.0 / controller_frequency;
-    } else {
-      RCLCPP_WARN(
-        rclcpp::get_logger("LimitedAccelGenerator"),
-        "A controller_frequency less than or equal to 0 has been set. "
-        "Ignoring the parameter, assuming a rate of 20Hz");
-      acceleration_time_ = 0.05;
-    }
+      "A controller_frequency less than or equal to 0 has been set. "
+      "Ignoring the parameter, assuming a rate of 20Hz");
   }
+  acceleration_time_ = nh->declare_or_get_parameter(
+    plugin_name + ".sim_period", default_sim_period);
 }
 
 void LimitedAccelGenerator::startNewIteration(const nav_2d_msgs::msg::Twist2D & current_velocity)
